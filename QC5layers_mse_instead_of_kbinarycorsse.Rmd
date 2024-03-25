@@ -1,0 +1,406 @@
+
+```{r}
+library(BioAge)
+library(ggplot2)
+```
+
+```{r}
+set.seed(123)  # For reproducibility
+
+# Assuming 'NAHNES3' is your dataframe
+required_columns <- c("sampleID", "status", "albumin","alp","lymph","mcv","lncreat","lncrp","hba1c","wbc","rdw", "age")
+
+# Select only the necessary columns
+data_selected <- NHANES3[, required_columns]
+
+data_selected <- na.omit(data_selected)
+
+# Keep the Id column separate
+ids <- data_selected$sampleID
+
+# Also, if you plan to use 'status' later, extract it here as well
+status_vector <- data_selected$status
+
+# This will be your untransformed 'age'
+age_raw <- data_selected$age 
+
+# Remove Id from the data to be normalized and processed
+data_for_vae <- data_selected[, -which(names(data_selected) %in% c("sampleID", "status"))]
+
+# Convert to matrix for processing
+data_matrix <- as.matrix(data_for_vae)
+
+# Normalize the data
+data_normalized <- scale(data_matrix)
+```
+
+required to adapt mnist?
+```{r}
+# Assuming data_normalized is a scaled matrix of your features
+
+# Define the proportion of data you want to use for training
+train_proportion <- 0.6
+validation_proportion <- 0.2
+
+# Calculate the number of samples for each dataset
+num_total_samples <- nrow(data_normalized)
+num_train_samples <- floor(num_total_samples * train_proportion)
+num_validation_samples <- floor(num_total_samples * validation_proportion)
+num_test_samples <- num_total_samples - (num_train_samples + num_validation_samples)
+
+# Create a random sequence to shuffle the data
+random_sequence <- sample(nrow(data_normalized))
+
+# Split the data into training, validation, and test sets
+x_train <- data_normalized[random_sequence[1:num_train_samples], ]
+x_val <- data_normalized[random_sequence[(num_train_samples + 1):(num_train_samples + num_validation_samples)], ]
+x_test <- data_normalized[random_sequence[(num_train_samples + num_validation_samples + 1):num_total_samples], ]
+
+# Apply the same sequence to shuffle and split the IDs and status_vector
+ids_train <- ids[random_sequence[1:num_train_samples]]
+ids_val <- ids[random_sequence[(num_train_samples + 1):(num_train_samples + num_validation_samples)]]
+ids_test <- ids[random_sequence[(num_train_samples + num_validation_samples + 1):num_total_samples]]
+
+status_train <- status_vector[random_sequence[1:num_train_samples]]
+status_val <- status_vector[random_sequence[(num_train_samples + 1):(num_train_samples + num_validation_samples)]]
+status_test <- status_vector[random_sequence[(num_train_samples + num_validation_samples + 1):num_total_samples]]
+
+age_train <- age_raw[random_sequence[1:num_train_samples]]
+age_val <- age_raw[random_sequence[(num_train_samples + 1):(num_train_samples + num_validation_samples)]]
+age_test <- age_raw[random_sequence[(num_train_samples + num_validation_samples + 1):num_total_samples]]
+
+```
+
+
+### adapting mnist
+```{r}
+original_dim <- 10 #input variables
+latent_dim <- 5L
+intermediate_dim <- 64L
+batch_size<- 32
+
+```
+
+
+```{r}
+# to prevent overfitting, but might also induce underfitting
+l2_reg <- regularizer_l2(0.001) 
+
+encoder_inputs <- layer_input(shape = original_dim)
+
+x <- encoder_inputs %>%
+# using regular relu  
+      layer_dense(intermediate_dim, activation = "relu", kernel_regularizer = l2_reg) 
+
+# for experiment with different activating function
+#%>%
+#            layer_dense(intermediate_dim) %>%
+#             layer_leaky_relu(alpha = 0.01) 
+
+z_mean    <- x %>% layer_dense(latent_dim, name = "z_mean", kernel_regularizer = l2_reg)
+z_log_var <- x %>% layer_dense(latent_dim, name = "z_log_var", kernel_regularizer = l2_reg)
+
+encoder <- keras_model(encoder_inputs, list(z_mean, z_log_var),
+                       name = "encoder")
+
+encoder
+
+```
+
+```{r}
+
+layer_sampler <- function(z_mean, z_log_var) {
+  epsilon <- k_random_normal(shape = k_shape(z_mean), mean = 0.0, stddev = 1.0)
+  z <- z_mean + k_exp(0.5 * z_log_var) * epsilon
+  return(z)
+}
+```
+
+```{r}
+latent_inputs <- layer_input(shape = c(latent_dim))
+
+decoder_outputs <- latent_inputs %>%
+    layer_dense(intermediate_dim, activation = "relu", kernel_regularizer = l2_reg) %>%
+    layer_dense(original_dim, activation = "sigmoid", kernel_regularizer = l2_reg)
+
+decoder <- keras_model(latent_inputs, decoder_outputs,
+                       name = "decoder")
+
+decoder
+```
+
+
+```{r}
+library(keras)
+library(purrr) # for transpose function
+
+# Define your custom VAE model class
+model_vae <- new_model_class(
+  classname = "VAE",
+  
+  # Initialization method
+  initialize = function(encoder, decoder, ...) {
+    super$initialize(...)
+    self$encoder <- encoder
+    self$decoder <- decoder
+    
+    # Initialize metrics and potentially a custom sampler if needed
+    self$total_loss_tracker <- metric_mean(name = "total_loss")
+    self$reconstruction_loss_tracker <- metric_mean(name = "reconstruction_loss")
+    self$kl_loss_tracker <- metric_mean(name = "kl_loss")
+  },
+  
+call = function(inputs, training = FALSE) {
+    c(z_mean, z_log_var) %<-% self$encoder(inputs)
+    z <- layer_sampler(z_mean, z_log_var)
+    reconstructed <- self$decoder(z)
+    reconstructed  # This is what the model outputs when you call it on some input
+  },
+  
+  # Define metrics to track
+  metrics = mark_active(function() {
+    list(self$total_loss_tracker, self$reconstruction_loss_tracker, self$kl_loss_tracker)
+  }),
+  
+  train_step = function(data) {
+  with(tf$GradientTape() %as% tape, {
+    c(z_mean, z_log_var) %<-% self$encoder(data)
+    
+    # Directly call layer_sampler as a function
+    z <- layer_sampler(z_mean, z_log_var)
+    
+    reconstruction <- self$decoder(z)
+
+    reconstruction_loss <- k_mean(loss_mean_squared_logarithmic_error(data, reconstruction), axis = -1)
+    
+    epsilon <- 1e-7
+    kl_loss <- -0.5 * k_mean(1 + z_log_var - k_square(z_mean) - k_exp(z_log_var) + epsilon, axis = -1)
+    total_loss <- reconstruction_loss + kl_loss
+  })
+
+  grads <- tape$gradient(total_loss, self$trainable_weights)
+  self$optimizer$apply_gradients(zip_lists(grads, self$trainable_weights))
+
+  self$total_loss_tracker$update_state(total_loss)
+  self$reconstruction_loss_tracker$update_state(reconstruction_loss)
+  self$kl_loss_tracker$update_state(kl_loss)
+
+  list(total_loss = self$total_loss_tracker$result(),
+       reconstruction_loss = self$reconstruction_loss_tracker$result(),
+       kl_loss = self$kl_loss_tracker$result())
+}
+
+)
+
+# Remember to compile and fit your model after defining it
+optimizer <- keras$optimizers$legacy$Adam()
+
+# Define the early stopping callback
+# early_stopping <- callback_early_stopping(
+#   monitor = "val_loss",  # The metric to monitor, could be 'loss' if no validation set used
+#   patience = 10,         # The number of epochs to wait before stopping after the best score
+#   restore_best_weights = TRUE  # Whether to restore model weights from the best epoch
+# )
+
+# Assuming `encoder` and `decoder` are already defined
+vae <- model_vae(encoder, decoder)
+vae %>% compile(optimizer = optimizer)
+vae %>% fit(x = x_train, epochs = 3, shuffle = TRUE, validation_data = list(x_val, x_val))
+# vae %>% fit(x_train, epochs = 6, shuffle = TRUE, callbacks = list(early_stopping))
+```
+
+it works :)
+
+```{r}
+x_test_encoded <- predict(encoder, x_train, batch_size = batch_size)
+```
+
+```{r}
+# Encode the input data to get the latent representation
+latent_representation <- encoder %>% predict(x_test)
+
+# Since the encoder outputs a list with means and log variances, we take the first element (means)
+# which will be used for reconstruction
+z_mean <- latent_representation[[1]]
+
+# Decode the latent representation to get the reconstructed data
+reconstructed_data <- decoder %>% predict(z_mean)
+
+```
+
+
+```{r}
+original_means <- attr(data_normalized, "scaled:center")
+original_sds <- attr(data_normalized, "scaled:scale")
+```
+
+```{r}
+reverse_normalization <- function(normalized_data, means, sds) {
+  t(t(normalized_data) * sds + means)
+}
+
+original_data_unnormalized <- reverse_normalization(data_normalized, original_means, original_sds)
+```
+
+```{r}
+reconstructed_data_unnormalized <- reverse_normalization(reconstructed_data, original_means, original_sds)
+```
+
+```{r}
+# This should return TRUE if the reversal of normalization is correct
+#all.equal(data_matrix, original_data_unnormalized, tolerance = 1e-8)
+
+```
+
+
+```{r}
+# Assume you have these from when you scaled your data:
+original_means <- attr(data_normalized, "scaled:center")
+original_sds <- attr(data_normalized, "scaled:scale")
+
+# Function to reverse normalization
+reverse_normalization <- function(normalized_data, means, sds) {
+  t(t(normalized_data) * sds + means)
+}
+
+# Decode the latent representations to get the reconstructed normalized data
+# Assuming `decoder` is your trained decoder model and `z_mean` contains the latent variables
+reconstructed_normalized <- decoder %>% predict(z_mean)
+
+# Now reverse the normalization of the reconstructed data
+reconstructed_data_unnormalized <- reverse_normalization(reconstructed_normalized, original_means, original_sds)
+
+# Assuming 'data_matrix' is your original data before normalization, 
+# now you can compare it with the reconstructed data
+#mse <- mean((data_matrix - reconstructed_data_unnormalized)^2)
+#print(paste("Mean Squared Error between original and reconstructed data:", mse))
+
+```
+
+maybe for recontructing
+```{r}
+# Decode the latent representations to get the reconstructed normalized data
+# Assuming `decoder` is your trained decoder model and `z_mean` contains the latent variables
+reconstructed_normalized <- decoder %>% predict(z_mean)
+
+# Now reverse the normalization of the reconstructed data
+reconstructed_data_unnormalized <- reverse_normalization(reconstructed_normalized, original_means, original_sds)
+
+# Assuming 'data_matrix' is your original data before normalization, 
+# now you can compare it with the reconstructed data
+#mse <- mean((data_matrix - reconstructed_data_unnormalized)^2)
+#print(paste("Mean Squared Error between original and reconstructed data:", mse))
+
+```
+
+
+now we have reconstructed_data_unnormalized and data_for_vae! the reconstructed age is not even close (yet). but we are more interested in the latent components
+
+```{r}
+#data(NHANES3)
+```
+
+### the interesting part is if we can get the latent dim (Z_mean?) to correlate with age and especially mortality 
+# mortality, measured as 1 or 0, or a probability distribution somehow? 
+# deltaAge = CA - reconstructedCA
+# latent variables, is this z_mean, Z_log_var or the compressed dimensions 
+# is the architechture of the network optimal, does it capture nonlinearity
+```{r}
+# Assuming 'latent_representation[[1]]' is your z_mean matrix and 'ages_test' is your age vector.
+z_mean_matrix <- latent_representation[[1]]
+num_latent_dims <- ncol(z_mean_matrix)  # This will change with your latent_dim variable.
+
+# Convert to a data frame for easier manipulation
+z_mean_df <- as.data.frame(z_mean_matrix)
+
+# Add age to the data frame
+z_mean_df$age <- x_test[, 10]
+
+# Initialize a vector to store correlations
+correlations <- numeric(num_latent_dims)
+
+# Calculate correlations for each latent dimension
+for(i in 1:num_latent_dims) {
+  correlations[i] <- cor(z_mean_df[[i]], z_mean_df$age)
+}
+
+# Print the correlations
+print(correlations)
+
+# Optionally, create plots for each latent dimension's correlation with age
+for(i in 1:num_latent_dims) {
+  p <- ggplot(z_mean_df, aes_string(x = names(z_mean_df)[i], y = 'age')) +
+       geom_point(alpha = 0.5) +
+       geom_smooth(method = "lm", color = "blue") +
+       labs(title = paste("Latent Dimension", i, "vs Age"),
+            x = paste("Latent Dimension", i),
+            y = "Age")
+  print(p)
+}
+
+```
+
+how latent variables correlate with mortality
+```{r}
+# Assuming z_mean_matrix has your latent variables and status_test has the corresponding mortality status
+# Ensure that status_test is a dataframe column or a vector that correctly matches the order of z_mean_matrix rows
+
+# Convert z_mean_matrix into a dataframe if it's not already
+z_mean_df <- as.data.frame(z_mean_matrix)
+
+# Add mortality status to this dataframe
+z_mean_df$status <- status_test
+
+# Perform logistic regression for each latent variable
+# Variable 1
+model_var1 <- glm(status ~ V1, data = z_mean_df, family = "binomial")
+summary(model_var1)
+
+# Variable 2
+model_var2 <- glm(status ~ V2, data = z_mean_df, family = "binomial")
+summary(model_var2)
+
+# Variable 3
+model_var1 <- glm(status ~ V3, data = z_mean_df, family = "binomial")
+summary(model_var1)
+
+# Variable 4
+model_var2 <- glm(status ~ V4, data = z_mean_df, family = "binomial")
+summary(model_var2)
+
+# Variable 5
+model_var2 <- glm(status ~ V5, data = z_mean_df, family = "binomial")
+summary(model_var2)
+```
+
+#Both V1 and V2 are significantly associated with mortality status, as indicated by their p-values. 
+#he negative coefficients for both V1 and V2 with respect to mortality status suggest that higher values in these latent dimensions might be associated with lower risk or odds of mortality.
+
+```{r}
+# Initialize an empty list to store models
+models <- list()
+ORs <- numeric(ncol(z_mean_matrix))  # A numeric vector to store the odds ratios
+
+# Loop through the latent variables and perform logistic regression
+for (i in 1:ncol(z_mean_matrix)) {
+  variable_name <- paste("V", i, sep = "")  # Construct the variable name string
+  formula <- as.formula(paste("status ~", variable_name))  # Create the formula
+  
+  # Fit the model and store it in the list
+  models[[variable_name]] <- glm(formula, data = z_mean_df, family = "binomial")
+  
+  # Extract the coefficient for the latent variable and calculate the odds ratio
+  ORs[i] <- exp(coef(models[[variable_name]])[variable_name])
+}
+
+# Now you have a list of models and a vector of odds ratios
+names(ORs) <- paste("V", 1:ncol(z_mean_matrix), sep = "")
+print(ORs)
+```
+
+#maybe trying one without CA but with mortality?
+
+#next steps
+#activator functions
+#change numer of latent space variables
+#regulariasation techniques 
