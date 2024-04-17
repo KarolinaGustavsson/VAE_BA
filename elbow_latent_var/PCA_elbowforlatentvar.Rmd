@@ -1,0 +1,118 @@
+---
+title: "elbowlatent_var"
+output: html_notebook
+---
+
+Using PCA to figure out how many latent variables are suitable for our VAE clock
+```{r}
+library(stats)
+library(BioAge)
+```
+
+```{r}
+data("NHANES3", package = "BioAge")
+#e_df <- NHANES3
+
+required_columns <- c("albumin","alp","lymph","mcv","lncreat","lncrp","hba1c","wbc","rdw", "age")
+e_df <- NHANES3[, required_columns]
+e_df <- na.omit(e_df)
+```
+
+
+```{r}
+# Assuming your data frame is named df and includes your 13 variables (age + 12 biomarkers)
+#library(stats)
+
+# Perform PCA
+pca_results <- prcomp(e_df, scale. = TRUE)
+
+# Plot variance explained by each principal component
+plot(pca_results$sdev^2 / sum(pca_results$sdev^2), type = 'b', xlab = "Principal Component", ylab = "Proportion of Variance Explained", main = "Scree Plot")
+
+# Cumulative sum of variance explained
+cum_var_explained <- cumsum(pca_results$sdev^2 / sum(pca_results$sdev^2))
+plot(cum_var_explained, type = 'b', xlab = "Number of Components", ylab = "Cumulative Proportion of Variance Explained", main = "Cumulative Variance Explained Plot")
+
+```
+we now want to do the same but include mortality
+```{r}
+required_columns <- c("status", "albumin","alp","lymph","mcv","lncreat","lncrp","hba1c","wbc","rdw", "age")
+d_df <- NHANES3[, required_columns]
+d_df <- na.omit(d_df)
+```
+
+```{r}
+# Perform PCA
+pca_results <- prcomp(d_df, scale. = TRUE)
+
+# Plot variance explained by each principal component
+plot(pca_results$sdev^2 / sum(pca_results$sdev^2), type = 'b', xlab = "Principal Component", ylab = "Proportion of Variance Explained", main = "Scree Plot")
+
+# Cumulative sum of variance explained
+cum_var_explained <- cumsum(pca_results$sdev^2 / sum(pca_results$sdev^2))
+plot(cum_var_explained, type = 'b', xlab = "Number of Components", ylab = "Cumulative Proportion of Variance Explained", main = "Cumulative Variance Explained Plot")
+```
+ignore the code below, it is not done
+======================================================================
+```{r}
+#install.packages("mclust")
+#install.packages("dirichletprocess")
+library(mclust)
+library(dirichletprocess)
+library(dplyr)
+```
+```{r}
+d_df_scaled <- scale(d_df)
+
+dp <- DirichletProcessMvnormal(d_df_scaled)
+dp <- Fit(dp, 10, progressBar = TRUE) #5000 is too much
+```
+
+```{r}
+#plot(dp) för många dim för detta
+pairs(d_df_scaled, col = dp$clusterLabels)
+```
+
+
+okej det tog för mycket tid, k-means är nog bättre initialt 
+```{r}
+library(stats)
+
+# Assume d_df_scaled is your scaled dataframe
+set.seed(123)  # Setting a seed for reproducibility
+kmeans_result <- kmeans(d_df_scaled, centers = 11, nstart = 25)  # Choose the number of clusters 'centers' you want
+
+# The nstart parameter runs the algorithm multiple times with different random initializations
+# and picks the best result to avoid local minima
+
+# To see the cluster assignments
+print(kmeans_result$cluster)
+
+# To see the centers of the clusters
+print(kmeans_result$centers)
+
+# To visualize the results, especially if your data is not too high-dimensional
+# you can plot the first two principal components
+library(ggplot2)
+
+d_df_pca <- prcomp(d_df_scaled)$x[, 1:2]  # Use PCA to reduce the data to two dimensions
+d_df_pca <- as.data.frame(d_df_pca)
+d_df_pca$cluster <- factor(kmeans_result$cluster)  # Add the cluster assignments
+
+ggplot(d_df_pca, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "K-Means Clustering Results on First Two Principal Components")
+
+```
+```{r}
+# Assume d_df_scaled is your scaled dataframe without the 'age' column
+bm_df_scaled <- d_df_scaled[ , !(names(d_df_scaled) %in% c("age", "status"))]
+
+# Find the optimal number of clusters (k) using the elbow method
+set.seed(123)
+wss <- sapply(1:10, function(k){kmeans(bm_df_scaled, k, nstart = 10)$totWithinss})
+plot(1:9, wss, type="b", xlab="Number of Clusters", ylab="Total within-clusters sum of squares")
+
+```
+
